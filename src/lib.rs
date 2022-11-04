@@ -75,17 +75,15 @@ use tracing_core::span::Attributes;
 use tracing_core::span::Id;
 use tracing_core::span::Record;
 use tracing_core::Event;
-use tracing_core::Level;
 use tracing_core::Subscriber;
 use tracing_log::NormalizeEvent;
 use tracing_subscriber::layer::Context as TracingContext;
 use tracing_subscriber::registry::LookupSpan;
 use url::Url;
 
-use ErrorInner as ErrorI;
-use level_map::LevelMap;
 use log_support::SerializeEventFieldMapStrippingLog;
 use no_subscriber::NoSubscriber;
+use ErrorInner as ErrorI;
 
 mod level_map;
 mod log_support;
@@ -115,7 +113,6 @@ impl error::Error for Error {}
 
 #[derive(Debug)]
 enum ErrorInner {
-    ReservedLabelLevel,
     InvalidLabelCharacter(char),
     InvalidLokiUrl,
 }
@@ -124,7 +121,6 @@ impl fmt::Display for ErrorInner {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::ErrorInner::*;
         match self {
-            ReservedLabelLevel => write!(f, "cannot add custom label for `level`"),
             InvalidLabelCharacter(c) => write!(f, "invalid label character: {:?}", c),
             InvalidLokiUrl => write!(f, "invalid Loki URL"),
         }
@@ -164,7 +160,6 @@ pub struct Layer {
 struct LokiEvent {
     trigger_send: bool,
     timestamp: SystemTime,
-    level: Level,
     message: String,
 }
 
@@ -176,6 +171,7 @@ struct SerializedEvent<'a> {
     extra_fields: &'a HashMap<String, String>,
     #[serde(flatten)]
     span_fields: serde_json::Map<String, serde_json::Value>,
+    level: &'a str,
     _spans: &'a [&'a str],
     _target: &'a str,
     _module_path: Option<&'a str>,
@@ -266,11 +262,11 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> tracing_subscriber::Layer<S> for La
         let _ = self.sender.try_send(LokiEvent {
             trigger_send: !meta.target().starts_with("tracing_loki"),
             timestamp,
-            level: *meta.level(),
             message: serde_json::to_string(&SerializedEvent {
                 event: SerializeEventFieldMapStrippingLog(event),
                 extra_fields: &self.extra_fields,
                 span_fields,
+                level: meta.level().as_str(),
                 _spans: &spans,
                 _target: meta.target(),
                 _module_path: meta.module_path(),
@@ -369,7 +365,7 @@ impl error::Error for BadRedirect {}
 pub struct BackgroundTask {
     loki_url: Url,
     receiver: ReceiverStream<LokiEvent>,
-    queues: LevelMap<SendQueue>,
+    queues: Vec<SendQueue>,
     buffer: Buffer,
     http_client: reqwest::Client,
     backoff_count: u32,
@@ -384,30 +380,13 @@ impl BackgroundTask {
         receiver: mpsc::Receiver<LokiEvent>,
         labels: &mut HashMap<String, String>,
     ) -> Result<BackgroundTask, Error> {
-        fn level_str(level: Level) -> &'static str {
-            match level {
-                Level::TRACE => "trace",
-                Level::DEBUG => "debug",
-                Level::INFO => "info",
-                Level::WARN => "warn",
-                Level::ERROR => "error",
-            }
-        }
-
-        if labels.contains_key("level") {
-            return Err(Error(ErrorI::ReservedLabelLevel));
-        }
+        let labels_encoded = labels_to_string(labels)?;
         Ok(BackgroundTask {
             receiver: ReceiverStream::new(receiver),
             loki_url: loki_url
                 .join("/loki/api/v1/push")
                 .map_err(|_| Error(ErrorI::InvalidLokiUrl))?,
-            queues: LevelMap::try_from_fn(|level| {
-                labels.insert("level".into(), level_str(level).into());
-                let labels_encoded = labels_to_string(labels)?;
-                labels.remove("level");
-                Ok(SendQueue::new(labels_encoded))
-            })?,
+            queues: vec![SendQueue::new(labels_encoded)],
             buffer: Buffer::new(),
             http_client: reqwest::Client::builder()
                 .user_agent(concat!(
@@ -452,7 +431,7 @@ impl Future for BackgroundTask {
         while let Poll::Ready(maybe_item) = Pin::new(&mut self.receiver).poll_next(cx) {
             match maybe_item {
                 Some(item) => {
-                    self.queues[item.level].push(item);
+                    self.queues[0].push(item);
                 }
                 None => receiver_done = true,
             }
@@ -484,7 +463,7 @@ impl Future for BackgroundTask {
                                 tracing::subscriber::set_default(NoSubscriber::default());
                             if drop_outstanding {
                                 let num_dropped: usize =
-                                    self.queues.values_mut().map(|q| q.drop_outstanding()).sum();
+                                    self.queues.iter_mut().map(|q| q.drop_outstanding()).sum();
                                 drop(default_guard);
                                 tracing::error!(
                                     num_dropped,
@@ -500,7 +479,7 @@ impl Future for BackgroundTask {
                             self.backoff_count = 0;
                         }
                         let res = res.map_err(|_| ());
-                        for q in self.queues.values_mut() {
+                        for q in self.queues.iter_mut() {
                             q.on_send_result(res);
                         }
                         send_task_done = true;
@@ -513,11 +492,11 @@ impl Future for BackgroundTask {
             }
             if self.send_task.is_none()
                 && !backing_off
-                && self.queues.values().any(|q| q.should_send())
+                && self.queues.iter().any(|q| q.should_send())
             {
                 let streams = self
                     .queues
-                    .values_mut()
+                    .iter_mut()
                     .map(|q| q.prepare_sending())
                     .filter(|s| !s.entries.is_empty())
                     .collect();
