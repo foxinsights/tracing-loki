@@ -1,6 +1,5 @@
 use std::fmt;
 use std::ops;
-use std::slice;
 use tracing_core::Level;
 
 #[derive(Default)]
@@ -15,26 +14,6 @@ fn level_index(level: Level) -> usize {
         Level::INFO => 2,
         Level::WARN => 3,
         Level::ERROR => 4,
-    }
-}
-
-impl<T> LevelMap<T> {
-    pub fn try_from_fn<E, F: FnMut(Level) -> Result<T, E>>(mut f: F) -> Result<LevelMap<T>, E> {
-        Ok(LevelMap {
-            map: [
-                f(Level::TRACE)?,
-                f(Level::DEBUG)?,
-                f(Level::INFO)?,
-                f(Level::WARN)?,
-                f(Level::ERROR)?,
-            ],
-        })
-    }
-    pub fn values(&self) -> slice::Iter<'_, T> {
-        self.map.iter()
-    }
-    pub fn values_mut(&mut self) -> slice::IterMut<'_, T> {
-        self.map.iter_mut()
     }
 }
 
